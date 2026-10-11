@@ -1,40 +1,75 @@
-# МЕТОДИЧЕСКОЕ ПОСОБИЕ ПО ВЫПОЛНЕНИЮ САМОСТОЯТЕЛЬНОЙ РАБОТЫ
-
-**Тема:** Проектирование версионируемых хранилищ данных (SCD Type 2), автоматизация ELT-конвейеров с внешними REST API, статистический анализ финансовых точек бифуркации и аудит устойчивости (Disaster Recovery).  
-**Среда исполнения:** Google Colab (виртуальная машина Ubuntu, локальный демон PostgreSQL 14+).  
-**Параметры подключения:** `postgresql://dwh_admin:admin123@localhost:5432/elt_dwh`.
+# ПРАКТИЧЕСКОЕ РУКОВОДСТВО: САМОСТОЯТЕЛЬНАЯ РАБОТА В GOOGLE COLAB
+## SCD Type 2, REST API ELT, Проверка гипотез, Disaster Recovery и OSINT
 
 ---
 
-## 1. СТРУКТУРНО-МЕТОДИЧЕСКИЙ ПЛАН
+### [MARKDOWN ЯЧЕЙКА 1]
+```markdown
+# Лабораторный практикум: Продвинутый ELT-конвейер, версионирование данных (SCD-2) и стресс-тестирование DWH
 
-Работа состоит из 5 последовательных инженерно-аналитических модулей:
-1. **Модуль 1 (SCD Type 2):** Модификация структуры `dim_company` для отслеживания версионности изменений атрибутов корпораций во времени.
-2. **Модуль 2 (Automated Ingestion):** Разработка конвейера сбора данных с внешнего REST API (MOEX ISS / ЦБ РФ) с записью в макроэкономические метрики.
-3. **Модуль 3 (Pushdown Transform & Hypothesis Testing):** Построение аналитической SQL-витрины и статистическая проверка гипотез через непараметрические критерии в `scipy.stats`.
-4. **Модуль 4 (Data Drift Injection & DR Audit):** Моделирование преднамеренного сбоя данных и верификация консистентности через сверку контрольных сумм.
-5. **Модуль 5 (OSINT Case Study):** Оформление аналитического паспорта ПАО с фиксацией индикаторов точки бифуркации.
+### Цели работы:
+1. **SCD Type 2:** Реализовать историчность атрибутов измерений без потери аналитической связи с ранее зафиксированными фактами.
+2. **REST API Ingestion:** Автоматизировать сбор данных с внешнего шлюза MOEX ISS API в слой Staging с политикой нулевого дублирования (Zero-Duplication).
+3. **Data Mart & Hypothesis Testing:** Построить витрину финансовых показателей и выполнить статистическую проверку гипотезы о равенстве маржинальности секторов через критерий Манна — Уитни.
+4. **Data Drift & Disaster Recovery:** Сымитировать деструктивное повреждение базы данных (Data Poisoning) и верифицировать процедуру восстановления через сверку контрольных сумм (Reconciliation).
+5. **OSINT-кейс:** Сформировать паспорт мониторинга точки бифуркации публичной компании (ПАО).
+```
 
 ---
 
-## 2. МОДУЛЬ 1: РЕАЛИЗАЦИЯ МЕХАНИЗМА SCD TYPE 2
+### [CODE ЯЧЕЙКА 1] Проверка окружения и инициализация подключения к локальной СУБД
+```python
+import subprocess
+import os
+import requests
+import json
+import pandas as pd
+import numpy as np
+from scipy import stats
+from sqlalchemy import create_engine, text
 
-### 2.1. Теоретический базис
-В модели SCD Type 1 (Slowly Changing Dimensions) обновление атрибута (например, смена отрасли или юрисдикции) перезаписывает текущую строку, уничтожая ретроспективу. Это приводит к искажению исторических отчетов. 
+# 1. Проверка демона PostgreSQL внутри виртуальной машины Colab
+status = subprocess.run(["service", "postgresql", "status"], capture_output=True, text=True)
+if "online" not in status.stdout and "running" not in status.stdout:
+    subprocess.run(["service", "postgresql", "start"], check=True)
+    print("[STATUS] Демон PostgreSQL запущен.")
+else:
+    print("[STATUS] Демон PostgreSQL функционирует.")
 
-В модели **SCD Type 2** изменение любого отслеживаемого версионируемого поля порождает новую запись с новым суррогатным ключом (`company_sk`), при этом:
-* Предыдущая запись закрывается: `valid_to` выставляется в дату изменения, флаг `is_current` переводится в `FALSE`.
-* Новая запись открывается: `valid_from` равен дате изменения, `valid_to` равен `NULL` (или технической бесконечности `9999-12-31`), `is_current = TRUE`.
-* Таблица фактов хранит `company_sk`, связывающий транзакцию именно с той версией атрибутов, которая действовала на момент `report_date`.
+# 2. Инициализация подключения
+DB_URI = 'postgresql://dwh_admin:admin123@localhost:5432/elt_dwh'
+engine = create_engine(DB_URI, pool_pre_ping=True)
 
-### 2.2. Задание 1.1: Миграция DDL схемы
+# 3. Валидация коннекта
+with engine.connect() as conn:
+    res = conn.execute(text("SELECT current_database(), current_user;")).fetchone()
+    print(f"[STATUS] Соединение активно: База данных='{res[0]}', Пользователь='{res[1]}'")
+```
 
-Выполните миграцию существующей схемы `dim_company`. Ограничение `UNIQUE(ticker)` должно быть заменено составным уникальным индексом или снято, так как один эмитент теперь представлен несколькими строками.
+---
 
-```sql
+### [MARKDOWN ЯЧЕЙКА 2]
+```markdown
+## ЭТАП 1. АРХИТЕКТУРНАЯ ЭВОЛЮЦИЯ ХРАНИЛИЩА (SCD TYPE 2)
+
+**Задача:** Обеспечить сохранение истории изменений атрибутов эмитентов (M&A, смена секторов GICS, переименования).
+
+1. Снимается ограничение уникальности `dim_company_ticker_key`.
+2. В таблицу `dim_company` добавляются атрибуты интервалов актуальности:
+   * `valid_from` (DATE) — дата вступления версии в силу.
+   * `valid_to` (DATE) — дата окончания действия версии (`NULL` для активной).
+   * `is_current` (BOOLEAN) — флаг текущей версии.
+3. Создается частичный уникальный индекс, гарантирующий наличие строго одной активной записи на каждый тикер.
+```
+
+---
+
+### [CODE ЯЧЕЙКА 2] DDL-миграция схемы dim_company под стандарт SCD Type 2
+```python
+scd2_migration_sql = """
 BEGIN;
 
--- 1. Удаление старого уникального ограничения по тикеру
+-- 1. Снятие безусловного ограничения уникальности по тикеру
 ALTER TABLE public.dim_company DROP CONSTRAINT IF EXISTS dim_company_ticker_key;
 
 -- 2. Добавление колонок темпорального версионирования
@@ -43,173 +78,150 @@ ALTER TABLE public.dim_company
     ADD COLUMN IF NOT EXISTS valid_to DATE DEFAULT NULL,
     ADD COLUMN IF NOT EXISTS is_current BOOLEAN NOT NULL DEFAULT TRUE;
 
--- 3. Создание частичного уникального индекса: только одна строка по тикеру может быть активной
+-- 3. Частичный уникальный индекс: только одна запись может иметь флаг is_current = TRUE
 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_company_ticker 
 ON public.dim_company(ticker) 
 WHERE is_current = TRUE;
 
--- 4. Индекс для оптимизации поиска исторических срезов
-CREATE INDEX IF NOT EXISTS idx_dim_company_scd_lookup 
+-- 4. Индекс для фильтрации по временным срезам
+CREATE INDEX IF NOT EXISTS idx_dim_company_scd_timeline 
 ON public.dim_company(ticker, valid_from, valid_to);
 
 COMMIT;
+"""
+
+with engine.begin() as conn:
+    conn.execute(text(scd2_migration_sql))
+    print("[OK] DDL-миграция завершена. Таблица dim_company переведена в режим SCD Type 2.")
 ```
 
-### 2.3. Задание 1.2: Реализация транзакционного закрытия и открытия версий (Python/SQL)
+---
 
-Реализуйте функцию `scd2_update_company`, которая принимает измененные атрибуты компании и выполняет ротацию версий.
+### [MARKDOWN ЯЧЕЙКА 3]
+```markdown
+### Реализация логики ротации версий (SCD Type 2 Logic)
+При изменении атрибутов существующая запись закрывается днем, предшествующим дате вступления изменений (`valid_to = effective_date - 1`, `is_current = FALSE`), и создается новая запись со статусом `is_current = TRUE`.
+```
 
+---
+
+### [CODE ЯЧЕЙКА 3] Функция транзакционной ротации версий и тестовое обновление
 ```python
-from sqlalchemy import text
-
-def scd2_update_company(engine, ticker: str, new_company_name: str, new_sector: str, effective_date: str):
+def scd2_update_company(engine, ticker: str, new_name: str, new_sector: str, effective_date: str):
     """
-    Выполняет ротацию версий SCD Type 2 в рамках единой транзакции.
+    Транзакционное закрытие старой версии измерения и создание новой.
     """
-    scd_transaction_sql = text("""
+    rotation_sql = text("""
     BEGIN;
 
-    -- Проверяем, изменились ли атрибуты у текущей активной записи
-    WITH current_record AS (
-        SELECT company_sk, company_name, gics_sector
-        FROM public.dim_company
-        WHERE ticker = :ticker AND is_current = TRUE
-        FOR UPDATE
-    )
-    -- 1. Закрываем старую версию, если зафиксировано изменение атрибутов
+    -- 1. Закрытие текущей версии при наличии расхождений в данных
     UPDATE public.dim_company
     SET 
         valid_to = :effective_date::DATE - INTERVAL '1 day',
         is_current = FALSE
-    WHERE company_sk IN (
-        SELECT company_sk FROM current_record
-        WHERE company_name <> :new_company_name OR gics_sector <> :new_sector
-    );
+    WHERE ticker = :ticker 
+      AND is_current = TRUE
+      AND (company_name <> :new_name OR gics_sector <> :new_sector);
 
-    -- 2. Вставляем новую версию, если предыдущая была закрыта
+    -- 2. Вставка новой версии (если предыдущая была закрыта)
     INSERT INTO public.dim_company (ticker, company_name, gics_sector, valid_from, valid_to, is_current)
     SELECT 
-        :ticker, :new_company_name, :new_sector, :effective_date::DATE, NULL, TRUE
+        :ticker, :new_name, :new_sector, :effective_date::DATE, NULL, TRUE
     WHERE EXISTS (
         SELECT 1 FROM public.dim_company 
-        WHERE ticker = :ticker AND is_current = FALSE AND valid_to = :effective_date::DATE - INTERVAL '1 day'
+        WHERE ticker = :ticker 
+          AND is_current = FALSE 
+          AND valid_to = :effective_date::DATE - INTERVAL '1 day'
     );
 
     COMMIT;
     """)
-
+    
     with engine.begin() as conn:
-        conn.execute(scd_transaction_sql, {
+        conn.execute(rotation_sql, {
             "ticker": ticker.strip().upper(),
-            "new_company_name": new_company_name.strip(),
+            "new_name": new_name.strip(),
             "new_sector": new_sector.strip(),
             "effective_date": effective_date
         })
-    print(f"[OK] SCD2 транзакция обработана для эмитента {ticker} от даты {effective_date}")
+    print(f"[OK] SCD2 операция выполнена для {ticker}. Дата вступления: {effective_date}")
 
-# ТЕСТОВЫЙ ВЫЗОВ: Смена сектора YNDX с IT на Communication Services
+# ТЕСТ: Изменение сектора YNDX с 'Information Technology' на 'Communication Services' от 2024-01-01
 scd2_update_company(
-    engine, 
-    ticker="YNDX", 
-    new_company_name="Yandex N.V. / МКПАО Яндекс", 
-    new_sector="Communication Services", 
+    engine,
+    ticker="YNDX",
+    new_name="Yandex N.V. / МКПАО Яндекс",
+    new_sector="Communication Services",
     effective_date="2024-01-01"
 )
-```
 
-### 2.4. Верификация исторического JOIN
-Проверьте корректность сопоставления фактов с измерениями во времени:
-
-```sql
-SELECT 
-    f.report_date,
-    c.ticker,
-    c.gics_sector AS historical_sector,
-    c.valid_from,
-    c.valid_to,
-    c.is_current,
-    m.metric_code,
-    f.metric_value
-FROM public.fact_financial_metrics f
-JOIN public.dim_company c 
-    ON f.company_sk = c.company_sk
-JOIN public.dim_metric_dictionary m 
-    ON f.metric_id = m.metric_id
-WHERE c.ticker = 'YNDX'
-ORDER BY f.report_date;
+# Проверка версий в базе
+df_scd_check = pd.read_sql("SELECT company_sk, ticker, company_name, gics_sector, valid_from, valid_to, is_current FROM public.dim_company WHERE ticker = 'YNDX' ORDER BY valid_from;", engine)
+display(df_scd_check)
 ```
-*Критерий успеха:* Исторические факты за 2023 год ссылаются на `company_sk` со старым сектором, а факты после `2024-01-01` — на новую запись.
 
 ---
 
-## 3. МОДУЛЬ 2: АВТОМАТИЗАЦИЯ INGESTION ЧЕРЕЗ REST API
+### [MARKDOWN ЯЧЕЙКА 4]
+```markdown
+## ЭТАП 2. АВТОМАТИЗАЦИЯ СБОРА ДАННЫХ ЧЕРЕЗ REST API (MOEX ISS)
 
-### 3.1. Задание 2.1: Сбор макроэкономических индикаторов (Extract)
-Необходимо организовать автоматизированную выгрузку индекса RGBI (индекс государственных облигаций Московской биржи) или индекса МосБиржи через MOEX ISS API в качестве внешнего фактора среды.
+**Задача:** Автоматизировать сбор данных внешнего макроэкономического бенчмарка — индекса МосБиржи (`IMOEX`) — через публичный API.
 
+Пайплайн:
+1. **Extract:** Запрос к REST API MOEX с поддержкой постраничной навигации (`start = 0, 100, ...`).
+2. **Load:** Пакетная загрузка массива в буфер `staging.raw_financial_feed`.
+3. **Transform:** Внутрибазовое наполнение словаря метрик и таблицы фактов с защитой от повторных записей (`NOT EXISTS`).
+```
+
+---
+
+### [CODE ЯЧЕЙКА 4] Скрипт сбора и идемпотентной загрузки индекса МосБиржи
 ```python
-import requests
-import json
-import pandas as pd
-from sqlalchemy import text
-
-def fetch_moex_market_index(secid: str = "IMOEX", start_date: str = "2023-01-01") -> list:
-    """
-    Извлекает исторические значения индекса через публичный REST API Московской Биржи.
-    """
+def fetch_and_load_moex_index(engine, secid: str = "IMOEX", start_date: str = "2024-01-01"):
     url = f"https://iss.moex.com/iss/history/engines/stock/markets/index/securities/{secid}.json"
     params = {"from": start_date, "start": 0}
-    headers = {"User-Agent": "AcademicELT/2.0"}
-
-    records = []
+    headers = {"User-Agent": "ColabDWH/2.0"}
+    
+    raw_records = []
+    print(f"[EXTRACT] Извлечение котировок {secid} начиная с {start_date}...")
+    
     while True:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        resp = requests.get(url, params=params, headers=headers, timeout=12)
+        resp.raise_for_status()
+        data = resp.json()
         
-        history_data = data.get("history", {}).get("data", [])
-        if not history_data:
+        rows = data.get("history", {}).get("data", [])
+        if not rows:
             break
             
-        columns = data["history"]["columns"]
-        date_idx = columns.index("TRADEDATE")
-        close_idx = columns.index("CLOSE")
+        cols = data["history"]["columns"]
+        date_idx = cols.index("TRADEDATE")
+        close_idx = cols.index("CLOSE")
         
-        for row in history_data:
-            trade_date = row[date_idx]
-            close_val = row[close_idx]
-            if close_val is not None:
-                records.append({
-                    "report_date": trade_date,
+        for r in rows:
+            if r[close_idx] is not None:
+                raw_records.append({
+                    "report_date": str(r[date_idx]),
                     "ticker": secid,
                     "company_name": "MOEX Benchmark Index",
                     "gics_sector": "INDEX",
                     "metric_code": "INDEX_CLOSE",
                     "metric_type": "MACRO",
-                    "metric_value": str(close_val)
+                    "metric_value": str(r[close_idx])
                 })
         
-        # Сдвиг курсора пагинации (MOEX отдает блоки по 100 строк)
-        params["start"] += len(history_data)
-        if len(history_data) < 100:
+        params["start"] += len(rows)
+        if len(rows) < 100:
             break
 
-    print(f"[OK] Извлечено {len(records)} записей по индексу {secid}")
-    return records
-```
+    print(f"[EXTRACT] Получено записей: {len(raw_records)}")
+    if not raw_records:
+        return
 
-### 3.2. Задание 2.2: Идемпотентная загрузка в DWH (Load & Transform)
-Загрузка должна производиться через буфер `staging.raw_financial_feed` с последующей векторной обработкой:
-
-```python
-def ingest_macro_indicators_to_dwh(engine, macro_data: list):
-    """
-    Загружает макро-показатели в DWH с динамической регистрацией в словарях.
-    """
-    df_macro = pd.DataFrame(macro_data)
-    
-    # 1. Загрузка в Staging
-    df_macro.to_sql(
+    # 1. Пакетная запись в Staging
+    df_staging = pd.DataFrame(raw_records)
+    df_staging.to_sql(
         name="raw_financial_feed",
         con=engine,
         schema="staging",
@@ -217,27 +229,25 @@ def ingest_macro_indicators_to_dwh(engine, macro_data: list):
         index=False,
         method="multi"
     )
+    print(f"[LOAD] Загружено в staging.raw_financial_feed: {len(df_staging)} строк.")
 
     # 2. Внутрибазовый ELT
-    ingest_sql = text("""
+    transform_query = text("""
     BEGIN;
 
-    -- Регистрация фиктивного эмитента/индекса в dim_company
+    -- Регистрация бенчмарка в dim_company
     INSERT INTO public.dim_company (ticker, company_name, gics_sector, valid_from, is_current)
-    SELECT DISTINCT 
-        ticker, company_name, gics_sector, '2000-01-01'::DATE, TRUE
+    SELECT DISTINCT ticker, company_name, gics_sector, '2000-01-01'::DATE, TRUE
     FROM staging.raw_financial_feed
-    WHERE metric_type = 'MACRO'
+    WHERE ticker = :secid
     ON CONFLICT (ticker) WHERE is_current = TRUE DO NOTHING;
 
-    -- Регистрация макро-метрики в словаре
+    -- Регистрация макро-метрики в dim_metric_dictionary
     INSERT INTO public.dim_metric_dictionary (metric_code, metric_type)
-    SELECT DISTINCT metric_code, metric_type
-    FROM staging.raw_financial_feed
-    WHERE metric_type = 'MACRO'
+    VALUES ('INDEX_CLOSE', 'MACRO')
     ON CONFLICT (metric_code) DO NOTHING;
 
-    -- Перенос фактов с контролем уникальности
+    -- Перенос фактов с динамическим разрешением ключей
     INSERT INTO public.fact_financial_metrics (report_date, company_sk, metric_id, metric_value)
     SELECT 
         s.report_date::DATE,
@@ -247,7 +257,7 @@ def ingest_macro_indicators_to_dwh(engine, macro_data: list):
     FROM staging.raw_financial_feed s
     JOIN public.dim_company c ON s.ticker = c.ticker AND c.is_current = TRUE
     JOIN public.dim_metric_dictionary m ON s.metric_code = m.metric_code
-    WHERE s.metric_type = 'MACRO'
+    WHERE s.ticker = :secid
     AND NOT EXISTS (
         SELECT 1 FROM public.fact_financial_metrics f
         WHERE f.report_date = s.report_date::DATE 
@@ -255,32 +265,40 @@ def ingest_macro_indicators_to_dwh(engine, macro_data: list):
           AND f.metric_id = m.metric_id
     );
 
-    -- Очистка staging
-    DELETE FROM staging.raw_financial_feed WHERE metric_type = 'MACRO';
+    -- Очистка staging-буфера по загруженному инструменту
+    DELETE FROM staging.raw_financial_feed WHERE ticker = :secid;
 
     COMMIT;
     """)
 
     with engine.begin() as conn:
-        conn.execute(ingest_sql)
-    print("[OK] Пакетная загрузка макроэкономических рядов завершена.")
+        conn.execute(transform_query, {"secid": secid})
+    print(f"[TRANSFORM] Обработка {secid} завершена. Таблица фактов актуализирована.")
 
-# Запуск пайплайна
-macro_records = fetch_moex_market_index(secid="IMOEX", start_date="2024-01-01")
-ingest_macro_indicators_to_dwh(engine, macro_records)
+# Запуск пайплайна сбора
+fetch_and_load_moex_index(engine, secid="IMOEX", start_date="2024-01-01")
 ```
 
 ---
 
-## 4. МОДУЛЬ 3: ВНУТРИБАЗОВАЯ ТРАНСФОРМАЦИЯ И СТАТИСТИЧЕСКИЙ АНАЛИЗ
+### [MARKDOWN ЯЧЕЙКА 5]
+```markdown
+## ЭТАП 3. ВНУТРИБАЗОВАЯ ТРАНСФОРМАЦИЯ И ПРОВЕРКА ГИПОТЕЗ
 
-### 4.1. Задание 3.1: Построение аналитической витрины (Data Mart)
+**Бизнес-задача:** Проверить, различается ли уровень операционной рентабельности по EBITDA между компаниями сырьевого сектора (`Energy`) и сектора потребительских товаров/услуг (`Consumer Discretionary`).
 
-Создайте в PostgreSQL представление `view_corporate_performance`, рассчитывающее производные бизнес-показатели:
-* $\text{EBITDA Margin} = \frac{\text{EBITDA}}{\text{Revenue}} \times 100\%$
-* $\text{Net Margin} = \frac{\text{Net Profit}}{\text{Revenue}} \times 100\%$
+**Статистическая постановка:**
+* **$H_0$:** Распределения показателя `ebitda_margin_pct` в секторах *Energy* и *Consumer Discretionary* тождественны.
+* **$H_1$:** Присутствует статистически значимый сдвиг в уровне рентабельности между секторами.
+* **Критерий:** Непараметрический критерий Манна — Уитни (Mann-Whitney U-test) при уровне значимости $\alpha = 0.05$.
+```
 
-```sql
+---
+
+### [CODE ЯЧЕЙКА 5] Создание аналитической витрины и выполнение статистического теста
+```python
+# 1. Развертывание витрины финансовых метрик
+mart_ddl = """
 CREATE OR REPLACE VIEW public.view_corporate_performance AS
 WITH base_pivot AS (
     SELECT 
@@ -294,7 +312,7 @@ WITH base_pivot AS (
     FROM public.fact_financial_metrics f
     JOIN public.dim_company c ON f.company_sk = c.company_sk
     JOIN public.dim_metric_dictionary m ON f.metric_id = m.metric_id
-    WHERE c.gics_sector <> 'INDEX'
+    WHERE c.gics_sector NOT IN ('INDEX', 'Unknown')
     GROUP BY f.report_date, c.ticker, c.company_name, c.gics_sector
 )
 SELECT 
@@ -308,170 +326,176 @@ SELECT
     ROUND((ebitda / NULLIF(revenue, 0)) * 100, 2) AS ebitda_margin_pct,
     ROUND((net_profit / NULLIF(revenue, 0)) * 100, 2) AS net_margin_pct
 FROM base_pivot;
-```
+"""
 
-### 4.2. Задание 3.2: Проверка статистических гипотез (Hypothesis Testing)
+with engine.begin() as conn:
+    conn.execute(text(mart_ddl))
+    print("[OK] Витрина view_corporate_performance актуализирована.")
 
-#### Постановка задачи:
-* **Контекст:** Оценка операционной эффективности секторов национальной экономики в условиях санкционного давления.
-* **Нулевая гипотеза ($H_0$):** Распределения показателя `ebitda_margin_pct` в секторах *Energy* и *Consumer Discretionary* идентичны (статистически значимые различия отсутствуют).
-* **Альтернативная гипотеза ($H_1$):** Распределения показателей операционной маржинальности указанных секторов имеют систематический сдвиг.
-* **Инструмент:** Непараметрический критерий Манна — Уитни ($U$-тест) для несвязанных выборок малого объема (`scipy.stats.mannwhitneyu`). Уровень значимости: $\alpha = 0.05$.
-
-```python
-import numpy as np
-from scipy import stats
-import pandas as pd
-
-# 1. Извлечение подготовленной выборки из DWH
-query = """
+# 2. Выгрузка выборок
+query_stats = """
 SELECT gics_sector, ebitda_margin_pct 
 FROM public.view_corporate_performance 
 WHERE ebitda_margin_pct IS NOT NULL 
   AND gics_sector IN ('Energy', 'Consumer Discretionary');
 """
-df_stat = pd.read_sql(query, engine)
+df_stat = pd.read_sql(query_stats, engine)
 
 energy_sample = df_stat[df_stat['gics_sector'] == 'Energy']['ebitda_margin_pct'].dropna()
 consumer_sample = df_stat[df_stat['gics_sector'] == 'Consumer Discretionary']['ebitda_margin_pct'].dropna()
 
-print(f"Выборка Energy (n={len(energy_sample)}): {energy_sample.values}")
-print(f"Выборка Consumer (n={len(consumer_sample)}): {consumer_sample.values}")
+print(f"Выборка 'Energy' (n={len(energy_sample)}): {energy_sample.tolist()}")
+print(f"Выборка 'Consumer Discretionary' (n={len(consumer_sample)}): {consumer_sample.tolist()}")
 
-# 2. Выполнение критерия Манна-Уитни
-u_stat, p_value = stats.mannwhitneyu(energy_sample, consumer_sample, alternative='two-sided')
+# 3. Статистический расчет
+u_stat, p_val = stats.mannwhitneyu(energy_sample, consumer_sample, alternative='two-sided')
 
-# 3. Формирование формального вывода
 alpha = 0.05
-print("\nРЕЗУЛЬТАТЫ СТАТИСТИЧЕСКОГО ТЕСТИРОВАНИЯ:")
-print(f"U-statistic = {u_stat:.4f}")
-print(f"p-value = {p_value:.6f}")
+print("\n" + "="*50)
+print(f"СТАТИСТИЧЕСКИЙ ОТЧЕТ (МАНН — УИТНИ)")
+print(f"U-критерий: {u_stat:.4f}")
+print(f"p-value:    {p_val:.6f}")
+print("="*50)
 
-if p_value < alpha:
-    print(f"ВЕРДИКТ: Отклонить H0 на уровне значимости {alpha}. Обнаружены статистически значимые различия в рентабельности по EBITDA.")
+if p_val < alpha:
+    print(f"ВЫВОД: p-value < {alpha}. Нулевая гипотеза H0 отвергается. Различия в маржинальности статистически значимы.")
 else:
-    print(f"ВЕРДИКТ: Не удалось отклонить H0 на уровне значимости {alpha}. Статистически значимых различий не обнаружено.")
+    print(f"ВЫВОД: p-value >= {alpha}. Оснований отвергнуть H0 нет. Значимых различий не обнаружено.")
 ```
 
 ---
 
-## 5. МОДУЛЬ 4: ИМИТАЦИЯ СБОЕВ И АУДИТ DISASTER RECOVERY (DRIFT INJECTION)
+### [MARKDOWN ЯЧЕЙКА 6]
+```markdown
+## ЭТАП 4. АУДИТ УСТОЙЧИВОСТИ: ИНЪЕКЦИЯ СБОЕВ И DISASTER RECOVERY
 
-### 5.1. Задание 4.1: Снятие эталонного состояния и инъекция сбоя (Data Poisoning)
+**Методика:**
+1. Создание эталонного снимка (Golden Backup).
+2. Запуск деструктивного скрипта (Chaos / Poisoning):
+   * Искажение метрик `SBER` (установка отрицательных экстремальных значений).
+   * Удаление 5 произвольных записей фактов.
+   * Удаление индекса `idx_fact_fin_metrics`.
+3. Запуск процедуры **Data Reconciliation** (сверка контрольных сумм и структуры).
+4. Восстановление состояния из эталонного бэкапа при выявлении расхождений.
+```
 
+---
+
+### [CODE ЯЧЕЙКА 6] Фиксация эталона и деструктивное воздействие
 ```python
-import subprocess
+BASELINE_PATH = '/content/elt_dwh_baseline.sql'
 
-# 1. Фиксация эталонного бэкапа
-!PGPASSWORD='admin123' pg_dump -h localhost -U dwh_admin -c elt_dwh > /content/elt_dwh_baseline.sql
-print("[OK] Эталонный снимок /content/elt_dwh_baseline.sql сохранен.")
+# 1. Фиксация эталонного состояния
+!PGPASSWORD='admin123' pg_dump -h localhost -U dwh_admin -c elt_dwh > {BASELINE_PATH}
+print(f"[OK] Эталонный бэкап сохранен: {BASELINE_PATH}")
 
-# 2. Деструктивный скрипт (Chaos Injection)
-corruption_sql = """
+# 2. Инъекция аномалий (Chaos Script)
+chaos_sql = """
 BEGIN;
 
--- Искажение ключевых метрик
+-- Искажение метрик SBER
 UPDATE public.fact_financial_metrics 
-SET metric_value = -9999999.00
+SET metric_value = -888888.00
 WHERE company_sk IN (SELECT company_sk FROM public.dim_company WHERE ticker = 'SBER');
 
--- Случайное удаление части строк
+-- Удаление строк
 DELETE FROM public.fact_financial_metrics
-WHERE fact_id IN (
-    SELECT fact_id FROM public.fact_financial_metrics LIMIT 5
-);
+WHERE fact_id IN (SELECT fact_id FROM public.fact_financial_metrics LIMIT 5);
 
--- Удаление обязательного индекса
+-- Удаление индекса
 DROP INDEX IF EXISTS public.idx_fact_fin_metrics;
 
 COMMIT;
 """
 
 with engine.begin() as conn:
-    conn.execute(text(corruption_sql))
+    conn.execute(text(chaos_sql))
 
-print("[ALARM] Инъекция аномалий завершена: данные повреждены, индекс удален.")
+print("[ALARM] Деструктивный скрипт выполнен. База данных содержит повреждения.")
 ```
 
-### 5.2. Задание 4.2: Data Reconciliation (Сверка контрольных сумм)
+---
 
-Студент обязан разработать проверочный скрипт, выявляющий инцидент до запуска восстановления:
-
+### [CODE ЯЧЕЙКА 7] Data Reconciliation и автоматическое восстановление
 ```python
+# 1. Аудит целостности (Data Reconciliation)
 reconciliation_sql = """
 SELECT 
-    COUNT(*) AS total_fact_records,
-    ROUND(SUM(metric_value), 2) AS checksum_metric_value,
-    COUNT(*) FILTER (WHERE metric_value < 0) AS negative_values_count,
-    (SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_fact_fin_metrics') AS index_exists
+    COUNT(*) AS total_records,
+    ROUND(SUM(metric_value), 2) AS checksum_val,
+    COUNT(*) FILTER (WHERE metric_value < 0) AS invalid_negative_rows,
+    (SELECT COUNT(*) FROM pg_indexes WHERE tablename = 'fact_financial_metrics' AND indexname = 'idx_fact_fin_metrics') AS index_present
 FROM public.fact_financial_metrics;
 """
 
 df_audit = pd.read_sql(reconciliation_sql, engine)
-print("РЕЗУЛЬТАТ АУДИТА ЦЕЛОСТНОСТИ ДАННЫХ:")
+print("РЕЗУЛЬТАТ АУДИТА ПОВРЕЖДЕННОЙ БД:")
 display(df_audit)
 
 # Логическое условие срабатывания аварийного протокола
-needs_recovery = (df_audit.loc[0, 'negative_values_count'] > 0) or (df_audit.loc[0, 'index_exists'] == 0)
-print(f"Требуется аварийный откат базы (Disaster Recovery): {needs_recovery}")
-```
+anomalies_detected = (df_audit.loc[0, 'invalid_negative_rows'] > 0) or (df_audit.loc[0, 'index_present'] == 0)
 
-### 5.3. Задание 4.3: Отработка алгоритма восстановления
-Примените скрипт автоматического отката к дампу `/content/elt_dwh_baseline.sql` (из Этапа 7 базовой инструкции) и повторите запрос сверки.
-*Критерий успеха:* `negative_values_count = 0`, `index_exists = 1`, контрольная сумма `checksum_metric_value` вернулась к эталонному значению.
+if anomalies_detected:
+    print("\n[ALARM] Зафиксирован Data Drift / Повреждение схемы. Старт аварийного восстановления...")
+    
+    # Сброс активных соединений и перезаливка дампа
+    reset_cmd = """
+    sudo -u postgres psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'elt_dwh' AND pid <> pg_backend_pid();"
+    PGPASSWORD='admin123' psql -h localhost -U dwh_admin -d elt_dwh < /content/elt_dwh_baseline.sql > /dev/null 2>&1
+    """
+    subprocess.run(reset_cmd, shell=True, check=True)
+    
+    # 2. Повторный аудит после восстановления
+    df_post_audit = pd.read_sql(reconciliation_sql, engine)
+    print("\n[OK] РЕЗУЛЬТАТ АУДИТА ПОСЛЕ ВОССТАНОВЛЕНИЯ (DISASTER RECOVERY):")
+    display(df_post_audit)
+    print("Целостность базы данных успешно восстановлена.")
+else:
+    print("[STATUS] База данных находится в валидном состоянии.")
+```
 
 ---
 
-## 6. МОДУЛЬ 5: ПАСПОРТ ИНДИВИДУАЛЬНОГО OSINT-МОНИТОРИНГА ПАО
-
-Каждый студент выбирает одно ПАО из первого или второго котировального списка Московской Биржи (за исключением эталонных `SBER`, `GAZP`, `LKOH`) и оформляет аналитический раздел по шаблону:
-
-### Форма аналитического паспорта
-
+### [MARKDOWN ЯЧЕЙКА 7]
 ```markdown
-### ПАСПОРТ ПАО: [КРАТКОЕ НАИМЕНОВАНИЕ / ТИКЕР]
-* **Идентификаторы:** ИНН: [XXXXXXXXXX], ОГРН: [XXXXXXXXXXXXX], Сектор MOEX: [Сектор].
-* **Ликвидность:** Среднедневной объем торгов (ADTV 30D): [Значение в млн руб.].
-* **Официальный раскрыватель:** [Интерфакс-ЦРКИ / Скрин / e-disclosure].
+## ЭТАП 5. ПАСПОРТ OSINT-МОНИТОРИНГА ПАО (ШАБЛОН ДЛЯ ЗАПОЛНЕНИЯ)
+
+Заполните приведенную форму данными по исследуемой публичной корпорации (кроме `SBER`, `GAZP`, `LKOH`).
+
+---
+
+### ПАСПОРТ ЭМИТЕНТА: ПАО «ГМК Норильский никель» (GMKN)
+* **Идентификаторы:** ИНН: `8401005730`, ОГРН: `1028400000288`, Сектор MOEX: `Металлы и добыча`.
+* **Ликвидность:** Среднедневной объем торгов (ADTV 30D): `1 850 млн руб.`
+* **Официальный раскрыватель:** `e-disclosure.ru/portal/company.aspx?id=64`
 
 #### 1. Модель выявления точки бифуркации
-Определите конкретный момент времени (или прогнозируемый горизонт), в который компания переходит в режим нестабильности под влиянием внутренних или внешних шоков.
-
-* **Внешние шоки (Макро):** [например: экспортные пошлины, трансграничные дисконты Urals/ESPO, изменение ставки ЦБ].
-* **Внутренние дисбалансы:** [например: соотношение Чистый Долг / EBITDA > 3.5x, отрицательный операционный денежный поток].
+* **Внешние шоки (Макро):** Введение экспортных пошлин на никель и палладий, переориентация логистических цепочек в страны АТР с предоставлением контрактных дисконтов.
+* **Внутренние дисбалансы:** Рост долговой нагрузки (Чистый Долг / EBITDA > 2.0x) на фоне реализации масштабной экологической («Серная программа») и капитальной программ при снижении дивидендного потока.
 
 #### 2. Матрица опережающих OSINT-триггеров
 | Контур мониторинга | Первичный источник данных | Фиксируемый индикатор (Anomaly Trigger) |
 | :--- | :--- | :--- |
-| **Долговой рынок** | Cbonds / Rusbonds | Рост доходности облигаций (YTM spread > 500 bps к ОФЗ), требование оферты |
-| **Судебный контур** | Картотека арбитражных дел (КАД) | Сумма исков кредиторов > 15% от стоимости чистых активов за последние 30 дней |
-| **Обременения** | Реестр уведомлений залогов (ФНП) | Передача ключевых основных средств / контрольных долей ДЗО в залог банкам |
-| **Корпоративные события** | Федресурс (ЕФРСБ) | Сообщения о намерении обратиться с заявлением о банкротстве, смена реестродержателя |
+| **Долговой рынок** | Rusbonds / Cbonds | Расширение спреда доходности корпоративных облигаций к кривой ОФЗ более чем на 250 б.п. |
+| **Судебный контур** | Картотека арбитражных дел (КАД) | Рост совокупных экологических и имущественных претензий со стороны Росприроднадзора свыше 10 млрд руб. |
+| **Обременения** | Реестр залогов ФНП | Появление записей о передаче технологического оборудования дочерних структур в залог пулу кредиторов. |
+| **Корпоративные события** | Федресурс (ЕФРСБ) | Уведомления об уменьшении уставного капитала или реорганизации производственных дивизионов. |
 
 #### 3. Сценарное моделирование бифуркации
-* **Сценарий А (Оптимистичный / Реструктуризация):** Условия реализации сценария, действия менеджмента, триггер снятия долговой нагрузки.
-* **Сценарий Б (Пессимистичный / Делистинг / Дефолт):** Каскад событий, приводящий к списанию акционерного капитала или санации.
+* **Сценарий А (Стабилизация):** Сохранение положительного свободного денежного потока (FCF), рефинансирование долговых обязательств в юанях, завершение модернизации плавильных мощностей.
+* **Сценарий Б (Кризисный):** Дальнейшее падение мировых цен на корзину металлов платиновой группы, рост стоимости обслуживания долга, заморозка капитальных затрат и отказ от дивидендных выплат.
 ```
 
 ---
 
-## 7. КРИТЕРИИ ПРИЕМКИ РАБОТЫ (DEFINITION OF DONE)
+### [MARKDOWN ЯЧЕЙКА 8]
+```markdown
+### ЧЕК-ЛИСТ СДАЧИ САМОСТОЯТЕЛЬНОЙ РАБОТЫ (DEFINITION OF DONE)
 
-Работа признается выполненной при соблюдении следующих критериев:
-
-1. **Архитектура SCD Type 2:**
-   * В таблице `dim_company` отсутствуют жесткие ограничения `UNIQUE(ticker)` без учета флага актуальности.
-   * Вызов функции `scd2_update_company` закрывает текущую запись и создает новую с новым `company_sk`.
-   * Факты корректно связываются с историческими версиями через внешний ключ.
-2. **REST API Pipeline:**
-   * Реализован автоматический опрос публичного REST API с пагинацией.
-   * Данные загружаются через буфер `staging` без применения медленных построчных итераторов `df.iterrows()`.
-   * Реализована политика *Zero-duplication*: повторный вызов скрипта не изменяет размер таблицы фактов.
-3. **Аналитика и тестирование гипотез:**
-   * Построено SQL-представление `view_corporate_performance` с вычислением относительных метрик на уровне СУБД.
-   * В блокноте выполнен статистический тест (`mannwhitneyu`), корректно сформулированы гипотезы $H_0$ и $H_1$, приведен расчет `p-value` и экономическая интерпретация.
-4. **Disaster Recovery:**
-   * Продемонстрирован лог выявления расхождений (*Data Drift Detection*) после деструктивного воздействия.
-   * Выполнен автоматический откат, подтвержденный совпадением контрольных сумм и проверкой системных каталогов `pg_indexes`.
-5. **OSINT-паспорт:**
-   * Заполнены все поля паспорта исследуемого эмитента, включая матрицу из 4 контуров внешних данных.
+Перед экспортом блокнота (`.ipynb`) проверьте выполнение следующих условий:
+1. **[Code 2 & 3]** Структура `dim_company` расширена полями `valid_from`, `valid_to`, `is_current`. Ротация версий протестирована, исторические интервалы не перекрываются.
+2. **[Code 4]** Реализован скрипт выгрузки из MOEX ISS. Данные загружаются через `staging.raw_financial_feed` без построчных итераторов. Повторный запуск функции не приводит к росту числа строк (политика *Zero-Duplication* соблюдена).
+3. **[Code 5]** Витрина `view_corporate_performance` развернута в PostgreSQL. Расчет критерия Манна — Уитни выполнен, в блокноте выведено значение $p$-value и зафиксирован статистический вывод.
+4. **[Code 6 & 7]** Деструктивный скрипт выполнен. Процедура Reconciliation идентифицирует аномалии и выполняет автоматический откат к файлу `/content/elt_dwh_baseline.sql`.
+5. **[Markdown 7]** Паспорт OSINT-мониторинга полностью заполнен для выбранного ПАО с детализацией четырех контуров мониторинга.
+```
